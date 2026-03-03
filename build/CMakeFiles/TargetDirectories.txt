@@ -1,0 +1,4 @@
+/workspaces/DPI/build/CMakeFiles/packet_analyzer.dir
+/workspaces/DPI/build/CMakeFiles/dpi_engine.dir
+/workspaces/DPI/build/CMakeFiles/edit_cache.dir
+/workspaces/DPI/build/CMakeFiles/rebuild_cache.dir

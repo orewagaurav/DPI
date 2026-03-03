@@ -12,11 +12,20 @@ set(SOURCES
     src/packet_parser.cpp
 )
 
+set(DPI_ENGINE_SOURCES
+    src/dpi_mt.cpp
+    src/pcap_reader.cpp
+    src/packet_parser.cpp
+    src/sni_extractor.cpp
+    src/types.cpp
+)
+
 # Header files location
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # Create the executable
 add_executable(packet_analyzer ${SOURCES})
+add_executable(dpi_engine ${DPI_ENGINE_SOURCES})
 
 # For macOS, we might need to link against system libraries later
 if(APPLE)
