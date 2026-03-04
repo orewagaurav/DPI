@@ -1,0 +1,26 @@
+{
+  "name": "dpi-backend",
+  "version": "1.0.0",
+  "description": "DPI Network Monitoring Backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "ship-logs": "node scripts/ship_logs.js",
+    "ship-logs:watch": "node scripts/ship_logs.js --watch",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "mongodb": "^7.1.0",
+    "morgan": "^1.10.1",
+    "winston": "^3.19.0"
+  }
+}
