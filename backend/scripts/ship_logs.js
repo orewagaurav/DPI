@@ -22,8 +22,7 @@ function getArg(flag, fallback) {
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : fallback;
 }
 const LOG_FILE = getArg("--file", path.resolve(__dirname, "..", "dpi_logs.json"));
-const API_BASE = getArg("--api", "https://dpi-backend.onrender.com");
-// const API_BASE = getArg("--api", "http://localhost:3000");
+const API_BASE = getArg("--api", "http://localhost:3000");
 const WATCH_MODE = args.includes("--watch");
 const BATCH_SIZE = Number(getArg("--batch", "50"));
 
