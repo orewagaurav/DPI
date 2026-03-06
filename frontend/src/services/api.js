@@ -5,7 +5,8 @@
 import axios from 'axios'
 
 const api = axios.create({
-  baseURL: '/api',
+  // baseURL: '/api',
+  baseURL: 'https://z-pw4a.onrender.com',
   timeout: 10000,
   headers: { 'Content-Type': 'application/json' },
 })
