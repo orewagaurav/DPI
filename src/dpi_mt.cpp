@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <optional>
+#include <sstream>
 
 #include "pcap_reader.h"
 #include "packet_parser.h"
@@ -24,6 +25,35 @@
 
 using namespace PacketAnalyzer;
 using namespace DPI;
+
+// =============================================================================
+// IP address helper — uint32_t (host-order) -> dotted string
+// =============================================================================
+static std::string ipToString(uint32_t ip) {
+    return std::to_string(ip & 0xFF) + "." +
+           std::to_string((ip >> 8) & 0xFF) + "." +
+           std::to_string((ip >> 16) & 0xFF) + "." +
+           std::to_string((ip >> 24) & 0xFF);
+}
+
+// =============================================================================
+// JSON escape helper
+// =============================================================================
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c;
+        }
+    }
+    return out;
+}
 
 // =============================================================================
 // Thread-Safe Queue
@@ -190,8 +220,10 @@ struct Stats {
 // =============================================================================
 class FastPath {
 public:
-    FastPath(int id, Rules* rules, Stats* stats, TSQueue<Packet>* output_queue)
-        : id_(id), rules_(rules), stats_(stats), output_queue_(output_queue) {}
+    FastPath(int id, Rules* rules, Stats* stats, TSQueue<Packet>* output_queue,
+             std::ofstream* json_log = nullptr, std::mutex* json_log_mutex = nullptr)
+        : id_(id), rules_(rules), stats_(stats), output_queue_(output_queue),
+          json_log_(json_log), json_log_mutex_(json_log_mutex) {}
     
     void start() {
         running_ = true;
@@ -215,6 +247,8 @@ private:
     TSQueue<Packet>* output_queue_;
     TSQueue<Packet> input_queue_;
     std::unordered_map<FiveTuple, FlowEntry, FiveTupleHash> flows_;
+    std::ofstream* json_log_;
+    std::mutex* json_log_mutex_;
     
     std::atomic<bool> running_{false};
     std::thread thread_;
@@ -250,11 +284,35 @@ private:
             stats_->recordApp(flow.app_type, flow.sni);
             
             // Forward or drop
+            std::string action_str;
             if (flow.blocked) {
                 stats_->dropped++;
+                action_str = "blocked";
             } else {
                 stats_->forwarded++;
+                action_str = "forwarded";
                 output_queue_->push(std::move(pkt));
+            }
+
+            // Emit JSON log line (written to dpi_logs.json)
+            if (json_log_) {
+                std::string protocol = "UNKNOWN";
+                if (flow.tuple.protocol == 6) protocol = (flow.tuple.dst_port == 443) ? "HTTPS" : "HTTP";
+                else if (flow.tuple.protocol == 17) protocol = "UDP";
+
+                std::ostringstream js;
+                js << "{\"src_ip\":\"" << ipToString(flow.tuple.src_ip)
+                   << "\",\"dest_ip\":\"" << ipToString(flow.tuple.dst_ip)
+                   << "\",\"domain\":\"" << jsonEscape(flow.sni)
+                   << "\",\"application\":\"" << jsonEscape(appTypeToString(flow.app_type))
+                   << "\",\"protocol\":\"" << protocol
+                   << "\",\"bytes\":" << flow.bytes
+                   << ",\"packets\":" << flow.packets
+                   << ",\"action\":\"" << action_str
+                   << "\"}";
+
+                std::lock_guard<std::mutex> lg(*json_log_mutex_);
+                *json_log_ << js.str() << "\n";
             }
         }
     }
@@ -370,9 +428,17 @@ public:
                   << "    Total FPs: " << std::setw(2) << total_fps << "     ║\n";
         std::cout << "╚══════════════════════════════════════════════════════════════╝\n\n";
         
-        // Create FP threads
+        // Open JSON log file for pipeline output
+        json_log_.open("dpi_logs.json", std::ios::out | std::ios::trunc);
+        if (json_log_.is_open()) {
+            std::cout << "[Engine] JSON log output: dpi_logs.json\n";
+        }
+        
+        // Create FP threads (pass json log stream)
         for (int i = 0; i < total_fps; i++) {
-            fps_.push_back(std::make_unique<FastPath>(i, &rules_, &stats_, &output_queue_));
+            fps_.push_back(std::make_unique<FastPath>(i, &rules_, &stats_, &output_queue_,
+                                                       json_log_.is_open() ? &json_log_ : nullptr,
+                                                       &json_log_mutex_));
         }
         
         // Create LB threads, each managing a subset of FPs
@@ -511,6 +577,12 @@ public:
         
         output.close();
         
+        // Close JSON log
+        if (json_log_.is_open()) {
+            json_log_.close();
+            std::cout << "[Engine] JSON logs written to dpi_logs.json\n";
+        }
+        
         // Print report
         printReport();
         
@@ -524,6 +596,8 @@ private:
     TSQueue<Packet> output_queue_;
     std::vector<std::unique_ptr<FastPath>> fps_;
     std::vector<std::unique_ptr<LoadBalancer>> lbs_;
+    std::ofstream json_log_;
+    std::mutex json_log_mutex_;
     
     void printReport() {
         std::cout << "\n";
