@@ -1,5 +1,11 @@
-// Multi-threaded DPI Engine - Fixed Version
-// Architecture: Reader -> LB threads -> FP threads -> Output
+// Multi-threaded DPI Engine v3.0 — Live Capture + File Mode
+// Architecture: Reader/Capture -> LB threads -> FP threads -> Output
+//
+// New in v3.0:
+//   - Live packet capture via libpcap (--interface flag)
+//   - Async HTTP log shipping to backend (--backend-url)
+//   - Signal handling for graceful shutdown
+//   - Dual-mode: file (existing) and live (new)
 
 #include <iostream>
 #include <fstream>
@@ -17,14 +23,27 @@
 #include <algorithm>
 #include <optional>
 #include <sstream>
+#include <csignal>
 
 #include "pcap_reader.h"
 #include "packet_parser.h"
 #include "sni_extractor.h"
 #include "types.h"
+#include "live_capture.h"
+#include "log_shipper.h"
 
 using namespace PacketAnalyzer;
 using namespace DPI;
+
+// =============================================================================
+// Global stop flag for signal handling (live capture mode)
+// =============================================================================
+static std::atomic<bool> g_stop_flag{false};
+
+static void signalHandler(int sig) {
+    std::cout << "\n[Signal] Caught signal " << sig << " — stopping capture...\n";
+    g_stop_flag.store(true, std::memory_order_release);
+}
 
 // =============================================================================
 // IP address helper — uint32_t (host-order) -> dotted string
@@ -221,9 +240,11 @@ struct Stats {
 class FastPath {
 public:
     FastPath(int id, Rules* rules, Stats* stats, TSQueue<Packet>* output_queue,
-             std::ofstream* json_log = nullptr, std::mutex* json_log_mutex = nullptr)
+             std::ofstream* json_log = nullptr, std::mutex* json_log_mutex = nullptr,
+             LogShipper* log_shipper = nullptr)
         : id_(id), rules_(rules), stats_(stats), output_queue_(output_queue),
-          json_log_(json_log), json_log_mutex_(json_log_mutex) {}
+          json_log_(json_log), json_log_mutex_(json_log_mutex),
+          log_shipper_(log_shipper) {}
     
     void start() {
         running_ = true;
@@ -249,6 +270,7 @@ private:
     std::unordered_map<FiveTuple, FlowEntry, FiveTupleHash> flows_;
     std::ofstream* json_log_;
     std::mutex* json_log_mutex_;
+    LogShipper* log_shipper_;
     
     std::atomic<bool> running_{false};
     std::thread thread_;
@@ -294,25 +316,33 @@ private:
                 output_queue_->push(std::move(pkt));
             }
 
-            // Emit JSON log line (written to dpi_logs.json)
+            // Build JSON log line
+            std::string protocol = "UNKNOWN";
+            if (flow.tuple.protocol == 6) protocol = (flow.tuple.dst_port == 443) ? "HTTPS" : "HTTP";
+            else if (flow.tuple.protocol == 17) protocol = "UDP";
+
+            std::ostringstream js;
+            js << "{\"src_ip\":\"" << ipToString(flow.tuple.src_ip)
+               << "\",\"dest_ip\":\"" << ipToString(flow.tuple.dst_ip)
+               << "\",\"domain\":\"" << jsonEscape(flow.sni)
+               << "\",\"application\":\"" << jsonEscape(appTypeToString(flow.app_type))
+               << "\",\"protocol\":\"" << protocol
+               << "\",\"bytes\":" << flow.bytes
+               << ",\"packets\":" << flow.packets
+               << ",\"action\":\"" << action_str
+               << "\"}";
+
+            std::string json_line = js.str();
+
+            // Write to local JSON log file
             if (json_log_) {
-                std::string protocol = "UNKNOWN";
-                if (flow.tuple.protocol == 6) protocol = (flow.tuple.dst_port == 443) ? "HTTPS" : "HTTP";
-                else if (flow.tuple.protocol == 17) protocol = "UDP";
-
-                std::ostringstream js;
-                js << "{\"src_ip\":\"" << ipToString(flow.tuple.src_ip)
-                   << "\",\"dest_ip\":\"" << ipToString(flow.tuple.dst_ip)
-                   << "\",\"domain\":\"" << jsonEscape(flow.sni)
-                   << "\",\"application\":\"" << jsonEscape(appTypeToString(flow.app_type))
-                   << "\",\"protocol\":\"" << protocol
-                   << "\",\"bytes\":" << flow.bytes
-                   << ",\"packets\":" << flow.packets
-                   << ",\"action\":\"" << action_str
-                   << "\"}";
-
                 std::lock_guard<std::mutex> lg(*json_log_mutex_);
-                *json_log_ << js.str() << "\n";
+                *json_log_ << json_line << "\n";
+            }
+
+            // Ship to backend via HTTP (live mode)
+            if (log_shipper_) {
+                log_shipper_->enqueue(json_line);
             }
         }
     }
@@ -414,6 +444,7 @@ public:
     struct Config {
         int num_lbs = 2;
         int fps_per_lb = 2;
+        std::string backend_url = "http://localhost:3000";
     };
     
     DPIEngine(const Config& cfg) : config_(cfg) {
@@ -421,7 +452,7 @@ public:
         
         std::cout << "\n";
         std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
-        std::cout << "║              DPI ENGINE v2.0 (Multi-threaded)                 ║\n";
+        std::cout << "║              DPI ENGINE v3.0 (Multi-threaded)                ║\n";
         std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
         std::cout << "║ Load Balancers: " << std::setw(2) << cfg.num_lbs 
                   << "    FPs per LB: " << std::setw(2) << cfg.fps_per_lb
@@ -433,30 +464,19 @@ public:
         if (json_log_.is_open()) {
             std::cout << "[Engine] JSON log output: dpi_logs.json\n";
         }
-        
-        // Create FP threads (pass json log stream)
-        for (int i = 0; i < total_fps; i++) {
-            fps_.push_back(std::make_unique<FastPath>(i, &rules_, &stats_, &output_queue_,
-                                                       json_log_.is_open() ? &json_log_ : nullptr,
-                                                       &json_log_mutex_));
-        }
-        
-        // Create LB threads, each managing a subset of FPs
-        for (int lb = 0; lb < cfg.num_lbs; lb++) {
-            std::vector<FastPath*> lb_fps;
-            int start = lb * cfg.fps_per_lb;
-            for (int i = 0; i < cfg.fps_per_lb; i++) {
-                lb_fps.push_back(fps_[start + i].get());
-            }
-            lbs_.push_back(std::make_unique<LoadBalancer>(lb, std::move(lb_fps)));
-        }
     }
-    
+
     void blockIP(const std::string& ip) { rules_.blockIP(ip); }
     void blockApp(const std::string& app) { rules_.blockApp(app); }
     void blockDomain(const std::string& dom) { rules_.blockDomain(dom); }
     
+    // =========================================================================
+    // process() — FILE MODE (existing behaviour, unchanged)
+    // =========================================================================
     bool process(const std::string& input_file, const std::string& output_file) {
+        // Create FP and LB threads (no log shipper in file mode)
+        createPipeline(nullptr);
+
         // Open input
         PcapReader reader;
         if (!reader.open(input_file)) return false;
@@ -473,8 +493,7 @@ public:
         output.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
         
         // Start all threads
-        for (auto& fp : fps_) fp->start();
-        for (auto& lb : lbs_) lb->start();
+        startPipeline();
         
         // Start output writer thread
         std::atomic<bool> output_running{true};
@@ -501,64 +520,7 @@ public:
         uint32_t pkt_id = 0;
         
         while (reader.readNextPacket(raw)) {
-            if (!PacketParser::parse(raw, parsed)) continue;
-            if (!parsed.has_ip || (!parsed.has_tcp && !parsed.has_udp)) continue;
-            
-            // Create packet
-            Packet pkt;
-            pkt.id = pkt_id++;
-            pkt.ts_sec = raw.header.ts_sec;
-            pkt.ts_usec = raw.header.ts_usec;
-            pkt.tcp_flags = parsed.tcp_flags;
-            pkt.data = std::move(raw.data);
-            
-            // Parse 5-tuple
-            auto parseIP = [](const std::string& ip) -> uint32_t {
-                uint32_t result = 0;
-                int octet = 0, shift = 0;
-                for (char c : ip) {
-                    if (c == '.') { result |= (octet << shift); shift += 8; octet = 0; }
-                    else if (c >= '0' && c <= '9') octet = octet * 10 + (c - '0');
-                }
-                return result | (octet << shift);
-            };
-            
-            pkt.tuple.src_ip = parseIP(parsed.src_ip);
-            pkt.tuple.dst_ip = parseIP(parsed.dest_ip);
-            pkt.tuple.src_port = parsed.src_port;
-            pkt.tuple.dst_port = parsed.dest_port;
-            pkt.tuple.protocol = parsed.protocol;
-            
-            // Calculate payload offset
-            pkt.payload_offset = 14;  // Ethernet
-            if (pkt.data.size() > 14) {
-                uint8_t ip_ihl = pkt.data[14] & 0x0F;
-                pkt.payload_offset += ip_ihl * 4;
-                
-                if (parsed.has_tcp && pkt.payload_offset + 12 < pkt.data.size()) {
-                    uint8_t tcp_off = (pkt.data[pkt.payload_offset + 12] >> 4) & 0x0F;
-                    pkt.payload_offset += tcp_off * 4;
-                } else if (parsed.has_udp) {
-                    pkt.payload_offset += 8;
-                }
-                
-                if (pkt.payload_offset < pkt.data.size()) {
-                    pkt.payload_length = pkt.data.size() - pkt.payload_offset;
-                } else {
-                    pkt.payload_length = 0;
-                }
-            }
-            
-            // Update stats
-            stats_.total_packets++;
-            stats_.total_bytes += pkt.data.size();
-            if (parsed.has_tcp) stats_.tcp_packets++;
-            else if (parsed.has_udp) stats_.udp_packets++;
-            
-            // Dispatch to LB (hash-based)
-            FiveTupleHash hasher;
-            size_t lb_idx = hasher(pkt.tuple) % lbs_.size();
-            lbs_[lb_idx]->queue().push(std::move(pkt));
+            dispatchRawPacket(raw, parsed, pkt_id);
         }
         
         std::cout << "[Reader] Done reading " << pkt_id << " packets\n";
@@ -568,8 +530,7 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         
         // Stop all threads
-        for (auto& lb : lbs_) lb->stop();
-        for (auto& fp : fps_) fp->stop();
+        stopPipeline();
         
         output_running = false;
         output_queue_.shutdown();
@@ -588,6 +549,96 @@ public:
         
         return true;
     }
+    
+    // =========================================================================
+    // captureLive() — LIVE CAPTURE MODE (new)
+    // =========================================================================
+    bool captureLive(const std::string& interface) {
+        // Create log shipper for real-time backend delivery
+        log_shipper_ = std::make_unique<LogShipper>(config_.backend_url, 10, 2000);
+        log_shipper_->start();
+
+        // Create and start the pipeline (with log shipper)
+        createPipeline(log_shipper_.get());
+        startPipeline();
+
+        // Open the live capture interface
+        LiveCapture capture(interface);
+        if (!capture.open()) {
+            std::cerr << "[Engine] Failed to open interface: " << interface << "\n";
+            std::cerr << "[Engine] Error: " << capture.lastError() << "\n";
+            std::cerr << "[Engine] Hint: try running with sudo\n";
+            stopPipeline();
+            log_shipper_->stop();
+            return false;
+        }
+
+        // Install signal handlers for graceful shutdown
+        std::signal(SIGINT, signalHandler);
+        std::signal(SIGTERM, signalHandler);
+
+        std::cout << "\n";
+        std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║            LIVE CAPTURE ACTIVE — Press Ctrl+C to stop        ║\n";
+        std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║ Interface: " << std::setw(15) << std::left << interface
+                  << "                                         ║\n";
+        std::cout << "║ Backend:   " << std::setw(48) << std::left << config_.backend_url
+                  << " ║\n";
+        std::cout << "╚══════════════════════════════════════════════════════════════╝\n\n";
+
+        // ---- Capture loop ----
+        RawPacket raw;
+        ParsedPacket parsed;
+        uint32_t pkt_id = 0;
+        auto last_status = std::chrono::steady_clock::now();
+
+        while (!g_stop_flag.load(std::memory_order_acquire)) {
+            if (!capture.capturePacket(raw)) {
+                // Timeout or no packet — just loop again
+                continue;
+            }
+
+            dispatchRawPacket(raw, parsed, pkt_id);
+
+            // Print periodic status every 5 seconds
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status).count() >= 5) {
+                std::cout << "[Live] Packets: " << stats_.total_packets.load()
+                          << "  Bytes: " << stats_.total_bytes.load()
+                          << "  Fwd: " << stats_.forwarded.load()
+                          << "  Drop: " << stats_.dropped.load()
+                          << "  Shipped: " << log_shipper_->sentCount()
+                          << "\n";
+                last_status = now;
+            }
+        }
+
+        // ---- Graceful shutdown ----
+        std::cout << "\n[Engine] Stopping live capture...\n";
+        capture.close();
+
+        // Wait for queues to drain
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        stopPipeline();
+
+        // Stop log shipper (drains remaining logs)
+        log_shipper_->stop();
+
+        // Close JSON log
+        if (json_log_.is_open()) {
+            json_log_.close();
+            std::cout << "[Engine] JSON logs written to dpi_logs.json\n";
+        }
+
+        printReport();
+
+        std::cout << "\n[LogShipper] Total sent: " << log_shipper_->sentCount()
+                  << "  Failed: " << log_shipper_->failedCount() << "\n";
+
+        return true;
+    }
 
 private:
     Config config_;
@@ -598,6 +649,114 @@ private:
     std::vector<std::unique_ptr<LoadBalancer>> lbs_;
     std::ofstream json_log_;
     std::mutex json_log_mutex_;
+    std::unique_ptr<LogShipper> log_shipper_;
+
+    // =========================================================================
+    // createPipeline() — build FP and LB threads
+    // =========================================================================
+    void createPipeline(LogShipper* shipper) {
+        int total_fps = config_.num_lbs * config_.fps_per_lb;
+
+        fps_.clear();
+        lbs_.clear();
+
+        // Create FP threads
+        for (int i = 0; i < total_fps; i++) {
+            fps_.push_back(std::make_unique<FastPath>(
+                i, &rules_, &stats_, &output_queue_,
+                json_log_.is_open() ? &json_log_ : nullptr,
+                &json_log_mutex_,
+                shipper));
+        }
+        
+        // Create LB threads, each managing a subset of FPs
+        for (int lb = 0; lb < config_.num_lbs; lb++) {
+            std::vector<FastPath*> lb_fps;
+            int start = lb * config_.fps_per_lb;
+            for (int i = 0; i < config_.fps_per_lb; i++) {
+                lb_fps.push_back(fps_[start + i].get());
+            }
+            lbs_.push_back(std::make_unique<LoadBalancer>(lb, std::move(lb_fps)));
+        }
+    }
+
+    // =========================================================================
+    // startPipeline() / stopPipeline()
+    // =========================================================================
+    void startPipeline() {
+        for (auto& fp : fps_) fp->start();
+        for (auto& lb : lbs_) lb->start();
+    }
+
+    void stopPipeline() {
+        for (auto& lb : lbs_) lb->stop();
+        for (auto& fp : fps_) fp->stop();
+    }
+
+    // =========================================================================
+    // dispatchRawPacket() — parse + dispatch a single raw packet to the LBs
+    //   Shared by both file mode and live capture mode.
+    // =========================================================================
+    void dispatchRawPacket(RawPacket& raw, ParsedPacket& parsed, uint32_t& pkt_id) {
+        if (!PacketParser::parse(raw, parsed)) return;
+        if (!parsed.has_ip || (!parsed.has_tcp && !parsed.has_udp)) return;
+
+        // Create packet
+        Packet pkt;
+        pkt.id = pkt_id++;
+        pkt.ts_sec = raw.header.ts_sec;
+        pkt.ts_usec = raw.header.ts_usec;
+        pkt.tcp_flags = parsed.tcp_flags;
+        pkt.data = std::move(raw.data);
+
+        // Parse 5-tuple
+        auto parseIP = [](const std::string& ip) -> uint32_t {
+            uint32_t result = 0;
+            int octet = 0, shift = 0;
+            for (char c : ip) {
+                if (c == '.') { result |= (octet << shift); shift += 8; octet = 0; }
+                else if (c >= '0' && c <= '9') octet = octet * 10 + (c - '0');
+            }
+            return result | (octet << shift);
+        };
+
+        pkt.tuple.src_ip = parseIP(parsed.src_ip);
+        pkt.tuple.dst_ip = parseIP(parsed.dest_ip);
+        pkt.tuple.src_port = parsed.src_port;
+        pkt.tuple.dst_port = parsed.dest_port;
+        pkt.tuple.protocol = parsed.protocol;
+
+        // Calculate payload offset
+        pkt.payload_offset = 14;  // Ethernet
+        if (pkt.data.size() > 14) {
+            uint8_t ip_ihl = pkt.data[14] & 0x0F;
+            pkt.payload_offset += ip_ihl * 4;
+
+            if (parsed.has_tcp && pkt.payload_offset + 12 < pkt.data.size()) {
+                uint8_t tcp_off = (pkt.data[pkt.payload_offset + 12] >> 4) & 0x0F;
+                pkt.payload_offset += tcp_off * 4;
+            } else if (parsed.has_udp) {
+                pkt.payload_offset += 8;
+            }
+
+            if (pkt.payload_offset < pkt.data.size()) {
+                pkt.payload_length = pkt.data.size() - pkt.payload_offset;
+            } else {
+                pkt.payload_length = 0;
+            }
+        }
+
+        // Update stats
+        stats_.total_packets++;
+        stats_.total_bytes += pkt.data.size();
+        if (parsed.has_tcp) stats_.tcp_packets++;
+        else if (parsed.has_udp) stats_.udp_packets++;
+
+        // Dispatch to LB (hash-based)
+        FiveTupleHash hasher;
+        size_t lb_idx = hasher(pkt.tuple) % lbs_.size();
+        lbs_[lb_idx]->queue().push(std::move(pkt));
+    }
     
     void printReport() {
         std::cout << "\n";
@@ -663,54 +822,115 @@ private:
 // =============================================================================
 void printUsage(const char* prog) {
     std::cout << R"(
-DPI Engine v2.0 - Multi-threaded Deep Packet Inspection
+DPI Engine v3.0 - Multi-threaded Deep Packet Inspection
 ========================================================
 
-Usage: )" << prog << R"( <input.pcap> <output.pcap> [options]
+Usage (file mode):
+  )" << prog << R"( <input.pcap> <output.pcap> [options]
+
+Usage (live capture mode):
+  )" << prog << R"( --interface <iface> [options]
 
 Options:
-  --block-ip <ip>        Block source IP
-  --block-app <app>      Block application (YouTube, Facebook, etc.)
-  --block-domain <dom>   Block domain (substring match)
-  --lbs <n>              Number of load balancer threads (default: 2)
-  --fps <n>              FP threads per LB (default: 2)
+  --interface <iface>     Capture live traffic from network interface
+  --list-interfaces       List available network interfaces and exit
+  --backend-url <url>     Backend URL for log shipping (default: http://localhost:3000)
+  --block-ip <ip>         Block source IP
+  --block-app <app>       Block application (YouTube, Facebook, etc.)
+  --block-domain <dom>    Block domain (substring match)
+  --lbs <n>               Number of load balancer threads (default: 2)
+  --fps <n>               FP threads per LB (default: 2)
 
-Example:
-  )" << prog << R"( capture.pcap filtered.pcap --block-app YouTube --block-ip 192.168.1.50
+Examples:
+  )" << prog << R"( capture.pcap filtered.pcap --block-app YouTube
+  sudo )" << prog << R"( --interface en0
+  sudo )" << prog << R"( --interface en0 --backend-url http://my-server:3000 --block-ip 10.0.0.50
 )";
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
+    if (argc < 2) {
         printUsage(argv[0]);
         return 1;
     }
-    
-    std::string input = argv[1];
-    std::string output = argv[2];
-    
+
+    // ---- Parse arguments ----
     DPIEngine::Config cfg;
     std::vector<std::string> block_ips, block_apps, block_domains;
-    
-    for (int i = 3; i < argc; i++) {
+    std::string interface;
+    bool list_interfaces = false;
+    std::vector<std::string> positional;
+
+    for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--block-ip" && i + 1 < argc) block_ips.push_back(argv[++i]);
-        else if (arg == "--block-app" && i + 1 < argc) block_apps.push_back(argv[++i]);
-        else if (arg == "--block-domain" && i + 1 < argc) block_domains.push_back(argv[++i]);
-        else if (arg == "--lbs" && i + 1 < argc) cfg.num_lbs = std::stoi(argv[++i]);
-        else if (arg == "--fps" && i + 1 < argc) cfg.fps_per_lb = std::stoi(argv[++i]);
+
+        if (arg == "--interface" && i + 1 < argc) {
+            interface = argv[++i];
+        } else if (arg == "--list-interfaces") {
+            list_interfaces = true;
+        } else if (arg == "--backend-url" && i + 1 < argc) {
+            cfg.backend_url = argv[++i];
+        } else if (arg == "--block-ip" && i + 1 < argc) {
+            block_ips.push_back(argv[++i]);
+        } else if (arg == "--block-app" && i + 1 < argc) {
+            block_apps.push_back(argv[++i]);
+        } else if (arg == "--block-domain" && i + 1 < argc) {
+            block_domains.push_back(argv[++i]);
+        } else if (arg == "--lbs" && i + 1 < argc) {
+            cfg.num_lbs = std::stoi(argv[++i]);
+        } else if (arg == "--fps" && i + 1 < argc) {
+            cfg.fps_per_lb = std::stoi(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            return 0;
+        } else if (arg[0] != '-') {
+            positional.push_back(arg);
+        } else {
+            std::cerr << "Unknown option: " << arg << "\n";
+            printUsage(argv[0]);
+            return 1;
+        }
     }
-    
+
+    // ---- List interfaces ----
+    if (list_interfaces) {
+        auto ifaces = LiveCapture::listInterfaces();
+        if (ifaces.empty()) {
+            std::cout << "No interfaces found. Try running with sudo.\n";
+        } else {
+            std::cout << "\nAvailable network interfaces:\n";
+            std::cout << "─────────────────────────────────────────────────\n";
+            for (const auto& [name, desc] : ifaces) {
+                std::cout << "  " << std::setw(20) << std::left << name << desc << "\n";
+            }
+            std::cout << "\nUsage: sudo " << argv[0] << " --interface <name>\n";
+        }
+        return 0;
+    }
+
+    // ---- Decide mode ----
     DPIEngine engine(cfg);
-    
+
     for (const auto& ip : block_ips) engine.blockIP(ip);
     for (const auto& app : block_apps) engine.blockApp(app);
     for (const auto& dom : block_domains) engine.blockDomain(dom);
-    
-    if (!engine.process(input, output)) {
+
+    if (!interface.empty()) {
+        // ═══════ LIVE CAPTURE MODE ═══════
+        if (!engine.captureLive(interface)) {
+            return 1;
+        }
+    } else if (positional.size() >= 2) {
+        // ═══════ FILE MODE (existing) ═══════
+        if (!engine.process(positional[0], positional[1])) {
+            return 1;
+        }
+        std::cout << "\nOutput written to: " << positional[1] << "\n";
+    } else {
+        std::cerr << "Error: specify either --interface <iface> or <input.pcap> <output.pcap>\n";
+        printUsage(argv[0]);
         return 1;
     }
-    
-    std::cout << "\nOutput written to: " << output << "\n";
+
     return 0;
 }

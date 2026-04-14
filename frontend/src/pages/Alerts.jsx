@@ -1,15 +1,16 @@
 import { useState, useEffect, useCallback } from 'react'
 import AlertsTable from '../components/AlertsTable'
 import { getAlerts } from '../services/api'
-
-const POLL_INTERVAL = 5000
+import { useSocket, useSocketStatus } from '../services/socket'
 
 export default function Alerts() {
   const [data, setData] = useState({ data: [], total: 0 })
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
   const limit = 20
+  const { connected } = useSocketStatus()
 
+  // Initial data hydration
   const fetchAlerts = useCallback(async () => {
     try {
       const res = await getAlerts({ page, limit })
@@ -23,16 +24,34 @@ export default function Alerts() {
 
   useEffect(() => {
     fetchAlerts()
-    const id = setInterval(fetchAlerts, POLL_INTERVAL)
-    return () => clearInterval(id)
   }, [fetchAlerts])
+
+  // ---- Real-time: prepend new alerts ----
+  useSocket('alert_update', (alert) => {
+    setData((prev) => ({
+      total: (prev.total || 0) + 1,
+      data: [alert, ...(prev.data || [])].slice(0, limit),
+    }))
+  })
 
   const totalPages = Math.ceil((data.total || 0) / limit)
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-white">Security Alerts</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-bold text-white">Security Alerts</h1>
+          <div className="flex items-center gap-1.5">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'
+              }`}
+            />
+            <span className="text-xs text-gray-500">
+              {connected ? 'Live' : 'Offline'}
+            </span>
+          </div>
+        </div>
         <span className="text-sm text-gray-500">{data.total} total alerts</span>
       </div>
 

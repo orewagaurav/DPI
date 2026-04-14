@@ -4,6 +4,7 @@
 
 const winston = require("winston");
 const { getDB } = require("../config/database");
+const { emitEvent } = require("./socketManager");
 
 // ---------------------------------------------------------------------------
 // Winston logger (console + file)
@@ -72,16 +73,23 @@ async function logTraffic({
 
   const result = await db.collection("traffic_logs").insertOne(doc);
 
+  // Emit real-time WebSocket event
+  emitEvent("traffic_update", { ...doc, _id: result.insertedId });
+
   // If the packet was blocked, also record a blocked_event
   if (action === "blocked") {
-    await db.collection("blocked_events").insertOne({
+    const blockedDoc = {
       timestamp: new Date(),
       src_ip,
       domain,
       application,
       rule_type: "dpi",
       reason: `Blocked ${application || domain} traffic`,
-    });
+    };
+    const blockedResult = await db.collection("blocked_events").insertOne(blockedDoc);
+
+    // Emit blocked event
+    emitEvent("blocked_event", { ...blockedDoc, _id: blockedResult.insertedId });
   }
 
   logger.info("Traffic logged", { src_ip, dest_ip, domain, action });
@@ -111,6 +119,10 @@ async function logAlert({ src_ip, alert_type, severity, description }) {
   };
 
   const result = await db.collection("security_alerts").insertOne(doc);
+
+  // Emit real-time WebSocket event
+  emitEvent("alert_update", { ...doc, _id: result.insertedId });
+
   logger.warn("Security alert", { src_ip, alert_type, severity });
 
   return result;

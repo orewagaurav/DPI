@@ -8,6 +8,9 @@
     "dev": "node --watch server.js",
     "ship-logs": "node scripts/ship_logs.js",
     "ship-logs:watch": "node scripts/ship_logs.js --watch",
+    "simulate": "node scripts/simulate_traffic.js",
+    "simulate:live": "node scripts/simulate_traffic.js --live",
+    "simulate:deploy": "node scripts/simulate_traffic.js --live --url https://dpi-tqlz.onrender.com",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -22,6 +25,7 @@
     "helmet": "^8.1.0",
     "mongodb": "^7.1.0",
     "morgan": "^1.10.1",
+    "socket.io": "^4.8.3",
     "winston": "^3.19.0"
   }
 }
