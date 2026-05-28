@@ -4,7 +4,20 @@
 This document explains **everything** about this project - from basic networking concepts to the complete code architecture. After reading this, you should understand exactly how packets flow through the system without needing to read the code.
 
 ---
-
+```bash
+curl -X POST https://dpi-tqlz.onrender.com/logs \
+-H "Content-Type: application/json" \
+-d '{
+  "src_ip":"192.168.1.10",
+  "dest_ip":"142.250.185.206",
+  "protocol":"HTTPS",
+  "domain":"youtube.com",
+  "application":"YouTube",
+  "bytes":1500,
+  "packets":10,
+  "action":"allowed"
+}'
+```
 ## Table of Contents
 
 1. [What is DPI?](#1-what-is-dpi)
